@@ -12,33 +12,48 @@ MODEL_FILE="${MODEL_FILE:-Cyber-Tiel-Coder-35B-A3B-MTP-UD-Q6_K_XL.gguf}"
 MODEL_DIR="${MODEL_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-${MODEL_DIR}/${MODEL_FILE}}"
 
-# Optional multimodal projector. The model card lists BF16 as the recommended
-# projector for vision use. Leave empty to run text-only.
+# Optional multimodal projector.
+# Set MMPROJ_FILE=mmproj-BF16.gguf for vision support.
 MMPROJ_FILE="${MMPROJ_FILE:-}"
 MMPROJ_PATH="${MODEL_DIR}/${MMPROJ_FILE}"
 
+# -----------------------------
 # Server
+# -----------------------------
+
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 API_KEY="${API_KEY:-}"
 MODEL_ALIAS="${MODEL_ALIAS:-cyber-tiel}"
 
+# -----------------------------
 # Context / batching
+# -----------------------------
+
 CTX_SIZE="${CTX_SIZE:-262144}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
 PARALLEL="${PARALLEL:-1}"
 
+# -----------------------------
 # GPU / MoE
+# -----------------------------
+
 GPU_LAYERS="${GPU_LAYERS:-99}"
 N_CPU_MOE="${N_CPU_MOE:-0}"
 
+# -----------------------------
 # Memory / attention
+# -----------------------------
+
 FLASH_ATTN="${FLASH_ATTN:-on}"
 CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
 
-# Sampling: agentic coding defaults from the model card.
+# -----------------------------
+# Sampling
+# -----------------------------
+
 TEMP="${TEMP:-0.6}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
@@ -47,16 +62,28 @@ MIN_P="${MIN_P:-0}"
 # Cyber/CTF profile can be selected with PROFILE=cyber.
 PROFILE="${PROFILE:-coding}"
 
-# MTP is deliberately OFF by default. Set MTP=true to enable speculative decoding.
+# -----------------------------
+# MTP
+# -----------------------------
+
+# OFF by default.
+# Set MTP=true to enable speculative decoding.
 MTP="${MTP:-false}"
 MTP_N_MAX="${MTP_N_MAX:-3}"
 
-# Download behavior
+# -----------------------------
+# Download
+# -----------------------------
+
 HF_TOKEN="${HF_TOKEN:-}"
 FORCE_DOWNLOAD="${FORCE_DOWNLOAD:-false}"
 
-# Optional extra llama-server arguments, space-separated.
+# Optional extra llama-server arguments.
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+# -----------------------------
+# Logging helpers
+# -----------------------------
 
 log() {
   echo "[cyber-tiel] $*"
@@ -67,12 +94,53 @@ die() {
   exit 1
 }
 
-command -v llama-server >/dev/null 2>&1 || die "llama-server not found in base image."
+# -----------------------------
+# Find llama-server
+# -----------------------------
+#
+# The official llama.cpp CUDA server image normally places the
+# executable at /app/llama-server.
+#
+# We explicitly check that location first and then provide
+# fallbacks for PATH/layout changes.
+# -----------------------------
+
+LLAMA_SERVER="${LLAMA_SERVER:-/app/llama-server}"
+
+if [[ ! -x "${LLAMA_SERVER}" ]]; then
+  log "llama-server not executable at ${LLAMA_SERVER}; searching PATH..."
+  LLAMA_SERVER="$(command -v llama-server 2>/dev/null || true)"
+fi
+
+if [[ -z "${LLAMA_SERVER}" || ! -x "${LLAMA_SERVER}" ]]; then
+  for candidate in \
+    /app/llama-server \
+    /usr/local/bin/llama-server \
+    /usr/bin/llama-server
+  do
+    if [[ -x "${candidate}" ]]; then
+      LLAMA_SERVER="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${LLAMA_SERVER}" || ! -x "${LLAMA_SERVER}" ]]; then
+  die "llama-server not found. Checked /app/llama-server, PATH, /usr/local/bin/llama-server and /usr/bin/llama-server."
+fi
+
+log "Using llama-server: ${LLAMA_SERVER}"
+
+# -----------------------------
+# Prepare model directory
+# -----------------------------
 
 mkdir -p "${MODEL_DIR}"
 
-# Hugging Face CLI is not guaranteed in the minimal server image, so use
-# the resolve endpoint directly. Xet-backed files are still served by HF.
+# -----------------------------
+# Hugging Face downloader
+# -----------------------------
+
 download_hf() {
   local repo="$1"
   local filename="$2"
@@ -85,97 +153,243 @@ download_hf() {
     return 0
   fi
 
-  log "Downloading ${repo}/${filename}"
-  log "Destination: ${destination}"
+  log "Downloading:"
+  log "  Repo: ${repo}"
+  log "  File: ${filename}"
+  log "  Destination: ${destination}"
 
   local auth_args=()
+
   if [[ -n "${HF_TOKEN}" ]]; then
-    auth_args=(-H "Authorization: Bearer ${HF_TOKEN}")
+    auth_args=(
+      -H
+      "Authorization: Bearer ${HF_TOKEN}"
+    )
   fi
 
-  curl -L --fail --retry 5 --retry-delay 3 --progress-bar \
+  curl \
+    -L \
+    --fail \
+    --retry 5 \
+    --retry-delay 3 \
+    --progress-bar \
     "${auth_args[@]}" \
     -o "${destination}.partial" \
     "${url}"
 
   mv "${destination}.partial" "${destination}"
+
+  log "Download complete: ${destination}"
 }
 
-download_hf "${MODEL_REPO}" "${MODEL_FILE}" "${MODEL_PATH}"
+# -----------------------------
+# Download main model
+# -----------------------------
 
-[[ -s "${MODEL_PATH}" ]] || die "Model download failed: ${MODEL_PATH}"
+download_hf \
+  "${MODEL_REPO}" \
+  "${MODEL_FILE}" \
+  "${MODEL_PATH}"
 
-# Build sampling profile.
+[[ -s "${MODEL_PATH}" ]] || \
+  die "Model download failed: ${MODEL_PATH}"
+
+# -----------------------------
+# Sampling profile
+# -----------------------------
+
 if [[ "${PROFILE}" == "cyber" ]]; then
   TOP_K="${CYBER_TOP_K:-40}"
   MIN_P="${CYBER_MIN_P:-0.05}"
-  log "Profile: cyber/CTF (top-k=${TOP_K}, min-p=${MIN_P})"
+
+  log "Profile: cyber/CTF"
+  log "  top-k=${TOP_K}"
+  log "  min-p=${MIN_P}"
 else
-  log "Profile: agentic coding (top-k=${TOP_K}, min-p=${MIN_P})"
+  log "Profile: agentic coding"
+  log "  top-k=${TOP_K}"
+  log "  min-p=${MIN_P}"
 fi
+
+# -----------------------------
+# Build llama-server arguments
+# -----------------------------
 
 ARGS=(
   -m "${MODEL_PATH}"
+
   --host "${HOST}"
   --port "${PORT}"
   --alias "${MODEL_ALIAS}"
+
   --jinja
+
   --ctx-size "${CTX_SIZE}"
+
   --batch-size "${BATCH_SIZE}"
   --ubatch-size "${UBATCH_SIZE}"
   --parallel "${PARALLEL}"
+
   -ngl "${GPU_LAYERS}"
+
   -fa "${FLASH_ATTN}"
+
   -ctk "${CACHE_TYPE_K}"
   -ctv "${CACHE_TYPE_V}"
+
   --temp "${TEMP}"
   --top-p "${TOP_P}"
   --top-k "${TOP_K}"
   --min-p "${MIN_P}"
 )
 
+# -----------------------------
+# CPU MoE offload
+# -----------------------------
+
 if [[ "${N_CPU_MOE}" != "0" ]]; then
-  ARGS+=(--n-cpu-moe "${N_CPU_MOE}")
+  ARGS+=(
+    --n-cpu-moe
+    "${N_CPU_MOE}"
+  )
+
   log "CPU MoE offload: ${N_CPU_MOE}"
-fi
-
-# MTP is optional. Without --spec-type draft-mtp, the embedded MTP tensors
-# are ignored by llama.cpp and the model behaves as the base model.
-if [[ "${MTP,,}" == "true" || "${MTP}" == "1" || "${MTP,,}" == "yes" ]]; then
-  ARGS+=(--spec-type draft-mtp --spec-draft-n-max "${MTP_N_MAX}")
-  log "MTP: ENABLED (draft max=${MTP_N_MAX})"
 else
-  log "MTP: DISABLED"
+  log "CPU MoE offload: disabled"
 fi
 
-# Vision support is opt-in. Download mmproj-BF16.gguf and set:
-# MMPROJ_FILE=mmproj-BF16.gguf
-if [[ -n "${MMPROJ_FILE}" ]]; then
-  download_hf "${MODEL_REPO}" "${MMPROJ_FILE}" "${MMPROJ_PATH}"
-  [[ -s "${MMPROJ_PATH}" ]] || die "mmproj download failed: ${MMPROJ_PATH}"
-  ARGS+=(--mmproj "${MMPROJ_PATH}")
-  log "Vision projector: ${MMPROJ_PATH}"
+# -----------------------------
+# MTP
+# -----------------------------
+
+if [[ "${MTP,,}" == "true" ||
+      "${MTP}" == "1" ||
+      "${MTP,,}" == "yes" ]]; then
+
+  ARGS+=(
+    --spec-type
+    draft-mtp
+
+    --spec-draft-n-max
+    "${MTP_N_MAX}"
+  )
+
+  log "MTP: ENABLED"
+  log "MTP draft max: ${MTP_N_MAX}"
+
+else
+
+  log "MTP: DISABLED"
+
 fi
+
+# -----------------------------
+# Vision / mmproj
+# -----------------------------
+
+if [[ -n "${MMPROJ_FILE}" ]]; then
+
+  download_hf \
+    "${MODEL_REPO}" \
+    "${MMPROJ_FILE}" \
+    "${MMPROJ_PATH}"
+
+  [[ -s "${MMPROJ_PATH}" ]] || \
+    die "mmproj download failed: ${MMPROJ_PATH}"
+
+  ARGS+=(
+    --mmproj
+    "${MMPROJ_PATH}"
+  )
+
+  log "Vision projector: ${MMPROJ_PATH}"
+
+else
+
+  log "Vision projector: disabled"
+
+fi
+
+# -----------------------------
+# API authentication
+# -----------------------------
 
 if [[ -n "${API_KEY}" ]]; then
-  ARGS+=(--api-key "${API_KEY}")
+
+  ARGS+=(
+    --api-key
+    "${API_KEY}"
+  )
+
   log "API authentication: enabled"
+
 else
+
   log "API authentication: disabled"
+
 fi
 
-# Extra arguments are intentionally appended last so advanced users can
-# override/add llama.cpp options from RunPod environment variables.
+# -----------------------------
+# Extra arguments
+# -----------------------------
+
 if [[ -n "${EXTRA_ARGS}" ]]; then
+
   # shellcheck disable=SC2206
   EXTRA_ARRAY=( ${EXTRA_ARGS} )
-  ARGS+=( "${EXTRA_ARRAY[@]}" )
+
+  ARGS+=(
+    "${EXTRA_ARRAY[@]}"
+  )
+
+  log "Extra llama-server arguments: ${EXTRA_ARGS}"
+
 fi
 
-log "Model: ${MODEL_REPO}:${MODEL_FILE}"
-log "Context: ${CTX_SIZE}"
-log "GPU layers: ${GPU_LAYERS}"
-log "Endpoint: http://${HOST}:${PORT}/v1"
+# -----------------------------
+# Final configuration
+# -----------------------------
+
+log "=========================================="
+log "Cyber-Tiel Server"
+log "=========================================="
+log "Model:"
+log "  ${MODEL_REPO}"
+log "  ${MODEL_FILE}"
+log ""
+log "Model path:"
+log "  ${MODEL_PATH}"
+log ""
+log "Context:"
+log "  ${CTX_SIZE}"
+log ""
+log "GPU layers:"
+log "  ${GPU_LAYERS}"
+log ""
+log "CPU MoE:"
+log "  ${N_CPU_MOE}"
+log ""
+log "Flash Attention:"
+log "  ${FLASH_ATTN}"
+log ""
+log "KV cache:"
+log "  K=${CACHE_TYPE_K}"
+log "  V=${CACHE_TYPE_V}"
+log ""
+log "MTP:"
+log "  ${MTP}"
+log ""
+log "Endpoint:"
+log "  http://${HOST}:${PORT}/v1"
+log ""
+log "llama-server:"
+log "  ${LLAMA_SERVER}"
+log "=========================================="
+
+# -----------------------------
+# Start llama-server
+# -----------------------------
+
 log "Starting llama-server..."
 
-exec llama-server "${ARGS[@]}"
+exec "${LLAMA_SERVER}" "${ARGS[@]}"
